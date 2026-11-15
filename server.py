@@ -4,12 +4,17 @@ GAS Tube 自前ストリームプロキシ (yt-dlp)
 - 実際の動画データは /playback?u=<encoded googlevideo URL> が Range付きで中継する
   (googlevideoのURLは取得したIPに紐づくことがあるため、ブラウザへ直接渡さず中継するのが安定)
 使い方:
-  pip install yt-dlp requests
+  pip install yt-dlp requests curl_cffi
   python server.py            # http://localhost:8080 で起動
   GASの Code.gs の STREAM_PROXY_BASE にこのサーバーの公開URLを設定する
 デプロイ: Render / Railway / Cloud Run / 自宅PC(Cloudflare Tunnel) など。
   Dockerfile同梱。環境変数 PORT に対応。
 注意: 自分が視聴する用途に限定してください。YouTubeの利用規約に従うこと。
+
+v13 (2026-11-15): RenderのIPではデフォルト取得が "Failed to extract any
+player response" で全滅したため、取得戦略を複数試す方式に変更。
+Chrome偽装(impersonate) -> TV埋め込み -> Android VR の順に試し、
+720p以上が取れた時点で打ち切る。取れた中で一番高画質の結果を返す。
 """
 import json, os, re, subprocess, sys, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,17 +24,49 @@ import requests
 CACHE = {}  # videoId -> (timestamp, payload)
 import time
 
+STRATEGIES = [
+    ["--impersonate", "chrome"],
+    ["--impersonate", "chrome", "--extractor-args", "youtube:player_client=tv_embedded"],
+    ["--extractor-args", "youtube:player_client=tv_embedded"],
+    ["--extractor-args", "youtube:player_client=android_vr"],
+    [],
+]
+
+def fetch_info(video_id: str) -> dict:
+    last_err = ""
+    best = None  # (max_height, info)
+    for args in STRATEGIES:
+        try:
+            out = subprocess.run(
+                [sys.executable, "-m", "yt_dlp", "-J", "--no-warnings", "--no-playlist",
+                 *args, f"https://www.youtube.com/watch?v={video_id}"],
+                capture_output=True, text=True, timeout=45)
+            if out.returncode != 0:
+                last_err = (out.stderr or "")[-300:]
+                continue
+            info = json.loads(out.stdout)
+            heights = [f.get("height") or 0 for f in info.get("formats", [])
+                       if f.get("url") and f.get("vcodec") not in (None, "none")]
+            if not heights:
+                last_err = "no playable formats"
+                continue
+            top = max(heights)
+            if best is None or top > best[0]:
+                best = (top, info)
+            if top >= 720:
+                break
+        except Exception as e:
+            last_err = str(e)
+            continue
+    if best is None:
+        raise RuntimeError(last_err or "extract failed")
+    return best[1]
+
 def get_streams(video_id: str, base: str = "") -> dict:
     now = time.time()
     if video_id in CACHE and now - CACHE[video_id][0] < 1800:
         return CACHE[video_id][1]
-    out = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "-J", "--no-warnings", "--no-playlist",
-         f"https://www.youtube.com/watch?v={video_id}"],
-        capture_output=True, text=True, timeout=60)
-    if out.returncode != 0:
-        raise RuntimeError(out.stderr[-500:])
-    info = json.loads(out.stdout)
+    info = fetch_info(video_id)
     progressive, adaptive_video, adaptive_audio = [], [], []
     hls = dash = ""
     for f in info.get("formats", []):
@@ -59,7 +96,6 @@ def get_streams(video_id: str, base: str = "") -> dict:
     payload = {"hls": hls, "dash": dash, "progressive": progressive,
                "adaptiveVideo": adaptive_video, "adaptiveAudio": adaptive_audio,
                "durationSeconds": info.get("duration") or 0, "isLive": bool(info.get("is_live"))}
-    # HLS/DASHも中継URLに書き換える（相対解決が要る場合はプログレッシブを優先させるため空でも可）
     CACHE[video_id] = (now, payload)
     return payload
 
